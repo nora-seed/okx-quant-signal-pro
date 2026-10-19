@@ -1,0 +1,162 @@
+"use strict";
+
+/**
+ * 20'li sayfalı piyasa tarayıcı.
+ * - Aktif USDT pariteleri gerçek OKX verisinden alınır (Spot / Futures ayrı).
+ * - Öncelik: 1) yüksek hacim  2) likidite  3) düşük spread  4) işlem yapılabilir.
+ * - Her turda tam 20 farklı coin (tekrar yok) analiz edilir.
+ * - Tarama sırasında sabit enstrüman listesi snapshot'ı kullanılır.
+ * - Taranan set IndexedDB'de kalıcı; kaldığı yerden devam eder, "Baştan Tara" sıfırlar.
+ * - Kullanıcıya uygun coin sayısı 20'den azsa kalan sayı doğru gösterilir.
+ */
+
+import { fetchInstruments, fetchTickers, fetchCandles, apiCache } from "./okxPublic";
+import { buildSignal, type Timeframe, type StrategyId, type Signal } from "./signalEngine";
+
+export type RankedCoin = {
+  instId: string;
+  skip: false;
+} & Record<string, unknown>;
+
+export type ScanProgress = {
+  current: number;       // 1..20 (şu an taranan)
+  total: number;         // her tur 20 (uygun coin az ise daha az)
+  round: number;         // 1..N
+  done: boolean;         // tüm enstrüman listesi bitti mi ( imminent.)
+  scannedCount: number;  // bu seferde toplam taranan
+  eligibleCount: number; // toplam uygun coin sayısı
+  remainingCount: number;// kalan (eligible - scanned)
+};
+
+export type ScanResultRow = Signal | { symbol: string; side: string; score: number; price: number; timeframe: Timeframe; strategy: string[]; error: string };
+
+export type ScanSnapshot = {
+  instIds: string[];      // sabit snapshot (tur içi değişmez)
+  scanned: string[];      // taranan coinler (tekrarları önler, kaldığı yeri tutar)
+};
+
+export type ScanOutput = {
+  rows: ScanResultRow[];
+  failed: { instId: string; reason: string }[];
+  progress: ScanProgress;
+  snapshot: ScanSnapshot;
+};
+
+/* ---------- Uygun enstrüman seçimi ve öncelik sıralaması ---------- */
+export function rankInstruments(insts: any[], tickers: any[], instType: "SPOT" | "SWAP"): string[] {
+  const tickerMap = new Map<string, any>(tickers.map((t) => [t.instId, t]));
+  const ranked = insts
+    .filter((i) => {
+      const id: string = i.instId || "";
+      if (!id.endsWith("-USDT")) return false;
+      if (instType === "SPOT" && !id.endsWith("-USDT")) return false;
+      if (instType === "SWAP" && !id.endsWith("-USDT-SWAP")) return false;
+      const t = tickerMap.get(id);
+      if (!t || t.last <= 0) return false; // fiyat yoksa uygun değil
+      const spread = t.ask - t.bid;
+      const mid = (t.ask + t.bid) / 2;
+      const relSpread = mid > 0 ? spread / mid : 1;
+      if (!(t.vol24h > 0)) return false;
+      // Likidite/spread eşiği: relative spread %0.5 altı (genişçe tuttk ki 20 coin bulunabilsin)
+      if (relSpread > 0.005) return false;
+      return true;
+    })
+    .map((i) => {
+      const t = tickerMap.get(i.instId);
+      // hacim: swap'ta volCcy24h varsa onu kullan (USDT hacmi), yoksa vol24h * fiyat
+      const volUsdt = t.volCcy24h ? t.volCcy24h : (t.vol24h || 0) * t.last;
+      return { instId: i.instId as string, volUsdt, last: t.last, relSpread: (t.ask - t.bid) / ((t.ask + t.bid) / 2) };
+    })
+    .sort((a, b) => {
+      // 1) hacim artan 2) (liği: daha küçük spread önce)
+      if (b.volUsdt !== a.volUsdt) return b.volUsdt - a.volUsdt;
+      return a.relSpread - b.relSpread;
+    });
+  return ranked.map((r) => r.instId);
+}
+
+export const BATCH_SIZE = 20;
+
+export function nextBatch(snapshot: ScanSnapshot): string[] {
+  const scanned = new Set(snapshot.scanned);
+  return snapshot.instIds.filter((id) => !scanned.has(id)).slice(0, BATCH_SIZE);
+}
+
+export function makeProgress(snapshot: ScanSnapshot, current: number, eligibleCount: number, done: boolean): ScanProgress {
+  const round = Math.floor(snapshot.scanned.length / BATCH_SIZE) + 1;
+  return {
+    current,
+    total: Math.min(BATCH_SIZE, eligibleCount - snapshot.scanned.length),
+    round,
+    done,
+    scannedCount: snapshot.scanned.length,
+    eligibleCount,
+    remainingCount: Math.max(0, eligibleCount - snapshot.scanned.length),
+  };
+}
+
+/* ---------- Tek tur: sonraki 20 coini tar ---------- */
+export async function scanNextBatch(opts: {
+  instType: "SPOT" | "SWAP";
+  timeframe: Timeframe;
+  strategy: StrategyId[];
+  prev?: ScanSnapshot | null;
+  onRow?: (row: ScanResultRow, idx: number) => void;
+  onProgress?: (p: ScanProgress) => void;
+  signal: (s: any) => Promise<void>;
+}): Promise<ScanOutput> {
+  const { instType, timeframe, strategy, onRow, onProgress } = opts;
+
+  // 1) Sabit snapshot
+  let snapshot: ScanSnapshot = opts.prev ?? { instIds: [], scanned: [] };
+  if (snapshot.instIds.length === 0 || snapshot.instIds.length === 0) {
+    const [insts, tickers] = await Promise.all([
+      fetchInstruments(instType),
+      fetchTickers(instType),
+    ]);
+    snapshot.instIds = rankInstruments(insts, tickers, instType);
+  }
+
+  const eligible = snapshot.instIds.length;
+  // cache'lenmiş mumları temizle: her tur taze veri çekilsin (60s TTL zaten cache'liyor, sorun yok)
+
+  // 2) Sonraki 20
+  const batch = nextBatch(snapshot);
+  if (batch.length === 0) {
+    // Liste bitti
+    const p = makeProgress({ ...snapshot, scanned: snapshot.scanned }, 0, eligible, true);
+    onProgress?.(p);
+    return { rows: [], failed: [], progress: p, snapshot };
+  }
+
+  // 3) Art arda (kontrollü eşzamanlılık: OKX rate-limit için sıralı) tara
+  const rows: ScanResultRow[] = [];
+  const failed: { instId: string; reason: string }[] = [];
+  for (let idx = 0; idx < batch.length; idx++) {
+    const instId = batch[idx];
+    onProgress?.(makeProgress({ instIds: snapshot.instIds, scanned: [...snapshot.scanned, ...batch.slice(0, idx)] }, idx + 1, eligible, false));
+    try {
+      const candles = await fetchCandles(instId, timeframe, 300);
+      if (candles.length < 200) {
+        const row: ScanResultRow = {
+          symbol: instId, side: "BEKLE", score: 0,
+          price: candles.length ? candles[candles.length - 1].close : 0,
+          timeframe, strategy: strategy as string[], error: "Yetersiz veri",
+        };
+        rows.push(row); onRow?.(row, idx);
+        snapshot.scanned.push(instId);
+        continue;
+      }
+      const sig = buildSignal({ symbol: instId, instType, candles, timeframe, strategy });
+      rows.push(sig); onRow?.(sig, idx);
+    } catch (e: any) {
+      failed.push({ instId, reason: e?.message || "veri hatası" });
+    }
+    snapshot.scanned.push(instId);
+  }
+
+  const done = snapshot.scanned.length >= eligible || nextBatch(snapshot).length === 0;
+  const progress = makeProgress(snapshot, BATCH_SIZE, eligible, done);
+  onProgress?.(progress);
+  return { rows, failed, progress, snapshot };
+}
