@@ -19,9 +19,12 @@ export type StrategyId =
   | "momentum" | "scalp" | "mtf" | "multi";
 
 export type SignalSide = "SPOT_AL" | "SPOT_SAT" | "FUTURES_LONG" | "FUTURES_SHORT" | "BEKLE";
+export type SignalStrength = "strong" | "watch" | "off";
 
 export type Signal = {
   rejectReasons?: string[];
+  strength?: SignalStrength;
+  watchReasons?: string[];
   symbol: string;
   instType: string;
   side: SignalSide;
@@ -277,6 +280,24 @@ export function buildSignal({
     if (rejectReasons.length === 0) rejectReasons.push("Koşullar kısmen sağlandı, teyit tamamlanamadı");
   }
 
+  // Üç seviye: strong (tam koşullar) / watch (sinyale yaklaşmış) / off (BEKLE)
+  let strength: SignalStrength = "off";
+  const watchReasons: string[] = [];
+  if (side !== "BEKLE") {
+    strength = "strong";
+  } else {
+    const nearScore = score >= 30;
+    const nearVolume = rv >= 0.8;
+    if (nearScore && nearVolume && hasDirection && n >= 200) {
+      if (score < 40) watchReasons.push("uyum puanı 40'a yakın değil (" + score + ")");
+      if (rv < 1.0) watchReasons.push("hacim ortalama üstüne yakın ama tam onaylı değil (" + round(rv, 2) + "x)");
+      if (adxVal < 20) watchReasons.push("trend gücü düşük (ADX " + round(adxVal, 1) + ")");
+      if (!strongTrend) watchReasons.push("ADX 25 strong-trend eşiği geçilmedi (" + round(adxVal, 1) + ")");
+      if (bullishSignals && bearishSignals) watchReasons.push("yön olgu çelişkisi");
+      strength = "watch";
+    }
+  }
+
   // ---------------- Giriş / Stop / TP (ATR ve yapı bazlı) ----------------
   let entry: number | null = null;
   let sl: number | null = null;
@@ -350,6 +371,8 @@ export function buildSignal({
       relativeVolume: round(rv,2), trend, structure,
     }, bestStrategy ? [bestStrategy] : activeStrategies);
   sig.rejectReasons = rejectReasons;
+  sig.strength = strength;
+  sig.watchReasons = watchReasons;
   return sig;
 }
 

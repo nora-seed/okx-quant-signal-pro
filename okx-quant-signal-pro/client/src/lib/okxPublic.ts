@@ -80,7 +80,7 @@ async function okxFetch(path: string, params: Record<string, string> = {}): Prom
 
 /* ---------- Public API metodları (tarayıcı) ---------- */
 
-const toBar = (tf: string) => (tf === "1h" ? "1H" : tf === "4h" ? "4H" : tf === "1d" ? "1D" : tf);
+export const toBar = (tf: string) => (tf === "1h" ? "1H" : tf === "4h" ? "4H" : tf === "1d" ? "1D" : tf);
 
 
 export type Ticker = {

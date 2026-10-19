@@ -10,8 +10,11 @@
  * - Kullanıcıya uygun coin sayısı 20'den azsa kalan sayı doğru gösterilir.
  */
 
-import { fetchInstruments, fetchTickers, fetchCandles, apiCache } from "./okxPublic";
+import { fetchInstruments, fetchTickers, fetchCandles, fetchHistoryCandles, toBar, apiCache } from "./okxPublic";
 import { buildSignal, type Timeframe, type StrategyId, type Signal } from "./signalEngine";
+
+/* Stabilcoin tabanlı çiftler hariç (stabilcoin/USDT çiftlerinde fırsat yok) */
+const STABLE_BASES = new Set(["USDC", "FDUSD", "TUSD", "DAI", "EURT", "USDE", "PYUSD", "EUR", "USDP", "AEUR", "BUSD", "XUSD"]);
 
 export type RankedCoin = {
   instId: string;
@@ -40,7 +43,31 @@ export type ScanOutput = {
   failed: { instId: string; reason: string }[];
   progress: ScanProgress;
   snapshot: ScanSnapshot;
+  /** Her coin için gerçekten OKX'e gönderilen bar (tf uygulandığının kanıtı) */
+  barsUsed: Record<string, string>;
+  /** Eksik mum için geçmiş candle'ların getirilip geri doldurulduğu coinler */
+  backfilled: string[];
 };
+
+/** Eksik mum varsa geçmiş candles endpoint'i ile geri doldurur */
+async function getCandlesWithBackfill(instId: string, tf: Timeframe, limit = 300): Promise<{ candles: any[]; backfilled: boolean }> {
+  const fresh = await fetchCandles(instId, tf, limit);
+  let complete = fresh.filter((c: any) => c.confirm === undefined || c.confirm !== 0);
+  let backfilled = false;
+  if (complete.length < 210) {
+    try {
+      const hist = await fetchHistoryCandles(instId, tf, Math.min(1000, 600));
+      const seen = new Set(complete.map((c: any) => c.ts));
+      const merged = [...complete];
+      for (const h of hist) {
+        if (!seen.has(h.ts) && (h.confirm === undefined || h.confirm !== 0)) { merged.push(h); seen.add(h.ts); }
+      }
+      merged.sort((a: any, b: any) => a.ts - b.ts);
+      if (merged.length > complete.length) { complete = merged.slice(-Math.max(300, complete.length)); backfilled = true; }
+    } catch { /* history endpoint yok/hata → mevcut veriyle devam */ }
+  }
+  return { candles: complete, backfilled };
+}
 
 /* ---------- Uygun enstrüman seçimi ve öncelik sıralaması ---------- */
 export function rankInstruments(insts: any[], tickers: any[], instType: "SPOT" | "SWAP"): string[] {
@@ -48,9 +75,11 @@ export function rankInstruments(insts: any[], tickers: any[], instType: "SPOT" |
   const ranked = insts
     .filter((i) => {
       const id: string = i.instId || "";
-      if (!id.endsWith("-USDT")) return false;
       if (instType === "SPOT" && !id.endsWith("-USDT")) return false;
       if (instType === "SWAP" && !id.endsWith("-USDT-SWAP")) return false;
+      // stabilcoin tabanlı çiftler hariç
+      const base = instType === "SPOT" ? id.replace("-USDT", "") : id.replace("-USDT-SWAP", "");
+      if (STABLE_BASES.has(base)) return false;
       const t = tickerMap.get(id);
       if (!t || t.last <= 0) return false; // fiyat yoksa uygun değil
       const spread = t.ask - t.bid;
@@ -83,7 +112,8 @@ export function nextBatch(snapshot: ScanSnapshot): string[] {
 }
 
 export function makeProgress(snapshot: ScanSnapshot, current: number, eligibleCount: number, done: boolean): ScanProgress {
-  const round = Math.floor(snapshot.scanned.length / BATCH_SIZE) + 1;
+  // 1..20→tur1, 21..40→tur2 ... (tamamlanan turlar sonrası doğru tur gösterilir)
+  const round = snapshot.scanned.length === 0 ? 1 : Math.floor((snapshot.scanned.length - 1) / BATCH_SIZE) + 1;
   return {
     current,
     total: Math.min(BATCH_SIZE, eligibleCount - snapshot.scanned.length),
@@ -126,28 +156,37 @@ export async function scanNextBatch(opts: {
     // Liste bitti
     const p = makeProgress({ ...snapshot, scanned: snapshot.scanned }, 0, eligible, true);
     onProgress?.(p);
-    return { rows: [], failed: [], progress: p, snapshot };
+    return { rows: [], failed: [], progress: p, snapshot, barsUsed: {}, backfilled: [] };
   }
 
   // 3) Art arda (kontrollü eşzamanlılık: OKX rate-limit için sıralı) tara
   const rows: ScanResultRow[] = [];
   const failed: { instId: string; reason: string }[] = [];
+  const barsUsed: Record<string, string> = {};
+  const backfilledCoins: string[] = [];
+  const barSent = toBar(timeframe); // gerçekten OKX'e gönderilen bar
+  const NaN_v = (v: any) => typeof v !== "number" || !isFinite(v);
   for (let idx = 0; idx < batch.length; idx++) {
     const instId = batch[idx];
     onProgress?.(makeProgress({ instIds: snapshot.instIds, scanned: [...snapshot.scanned, ...batch.slice(0, idx)] }, idx + 1, eligible, false));
     try {
-      const candles = await fetchCandles(instId, timeframe, 300);
-      if (candles.length < 200) {
+      const { candles, backfilled } = await getCandlesWithBackfill(instId, timeframe, 300);
+      barsUsed[instId] = barSent;
+      if (backfilled) backfilledCoins.push(instId);
+      const clean = candles.filter((c: any) => !NaN_v(c.ts) && !NaN_v(c.close) && !NaN_v(c.open));
+      if (clean.length < 200) {
         const row: ScanResultRow = {
           symbol: instId, side: "BEKLE", score: 0,
-          price: candles.length ? candles[candles.length - 1].close : 0,
+          price: clean.length ? clean[clean.length - 1].close : 0,
           timeframe, strategy: strategy as string[], error: "Yetersiz veri",
         };
         rows.push(row); onRow?.(row, idx);
         snapshot.scanned.push(instId);
         continue;
       }
-      const sig = buildSignal({ symbol: instId, instType, candles, timeframe, strategy });
+      const sig = buildSignal({ symbol: instId, instType, candles: clean, timeframe, strategy });
+      (sig as any).barSent = barSent;
+      sig.strategy = [...strategy]; // kullanıcı seçiminin gerçekten uygulandığını kaydet
       rows.push(sig); onRow?.(sig, idx);
     } catch (e: any) {
       failed.push({ instId, reason: e?.message || "veri hatası" });
@@ -158,5 +197,5 @@ export async function scanNextBatch(opts: {
   const done = snapshot.scanned.length >= eligible || nextBatch(snapshot).length === 0;
   const progress = makeProgress(snapshot, BATCH_SIZE, eligible, done);
   onProgress?.(progress);
-  return { rows, failed, progress, snapshot };
+  return { rows, failed, progress, snapshot, barsUsed, backfilled: backfilledCoins };
 }

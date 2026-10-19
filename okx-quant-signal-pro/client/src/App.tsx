@@ -304,6 +304,7 @@ function Scanner({ setPage, apiStatus }: { setPage: (p: PageName) => void; apiSt
   const [progress, setProgress] = useState<ScanProgress | null>(null);
   const [snapshot, setSnapshot] = useState<ScanSnapshot | null>(null);
   const [scanError, setScanError] = useState<string | null>(null);
+  const [diagnostics, setDiagnostics] = useState<{ analyzed: number; apiErrors: number; strongAL: number; strongSAT: number; watch: number; bekle: number; backfilled: string[] } | null>(null);
   const listDone = progress?.done === true;
 
   // Kayıtlı strateji tercihini açılışta uygula
@@ -346,9 +347,20 @@ function Scanner({ setPage, apiStatus }: { setPage: (p: PageName) => void; apiSt
           try { await api.saveSignal(r); } catch { /* sessiz */ }
         }
       }
-      setResults((prevRows) => beginFromScratch ? out.rows : [...prevRows, ...out.rows]);
+      // Sadece bu turun 20 sonucu gösterilir; önceki turlar ekrandan kaldırılır
+      setResults(out.rows);
       setFailed(out.failed);
       setProgress(out.progress);
+      const okRows = out.rows.filter((r: any) => !("error" in r)) as any[];
+      setDiagnostics({
+        analyzed: okRows.length,
+        apiErrors: out.failed.length,
+        strongAL: okRows.filter((r) => r.strength === "strong" && (r.side === "SPOT_AL" || r.side === "FUTURES_LONG")).length,
+        strongSAT: okRows.filter((r) => r.strength === "strong" && (r.side === "SPOT_SAT" || r.side === "FUTURES_SHORT")).length,
+        watch: okRows.filter((r) => r.strength === "watch").length,
+        bekle: okRows.filter((r) => r.strength === "off").length,
+        backfilled: out.backfilled,
+      });
       await persistSnapshot(out.snapshot);
     } catch (e: any) {
       setScanError(e?.message || "Tarama başarısız");
@@ -419,6 +431,25 @@ function Scanner({ setPage, apiStatus }: { setPage: (p: PageName) => void; apiSt
         </div>
       )}
 
+      {/* TEŞHİS PANELİ */}
+      {diagnostics && (
+        <div className="card">
+          <div className="sub">TARAMA TEŞHİS PANELİ</div>
+          <div className="perf-grid">
+            <div className="perf-cell"><div className="k">Analiz edilen</div><div className="v">{diagnostics.analyzed}</div></div>
+            <div className="perf-cell"><div className="k">API hatalı</div><div className="v">{diagnostics.apiErrors}</div></div>
+            <div className="perf-cell"><div className="k">Güçlü AL/LONG</div><div className="v pos">{diagnostics.strongAL}</div></div>
+            <div className="perf-cell"><div className="k">Güçlü SAT/SHORT</div><div className="v neg">{diagnostics.strongSAT}</div></div>
+            <div className="perf-cell"><div className="k">İzleme Listesi</div><div className="v">{diagnostics.watch}</div></div>
+            <div className="perf-cell"><div className="k">BEKLE</div><div className="v muted">{diagnostics.bekle}</div></div>
+          </div>
+          {diagnostics.backfilled.length > 0 && (
+            <div className="small mt-6">Geçmiş mum geri doldurulan coinler: {diagnostics.backfilled.join(", ")}</div>
+          )}
+          <div className="small mt-6">Zaman dilimi uygulanmış: <b>{TF_LABELS[timeframe] ?? timeframe}</b> — kart başlıklarında her coinin gerçek OKX barı (ör. 4H) gösterilir.</div>
+        </div>
+      )}
+
       <div className="card">
         <div className="sub">SONUÇLAR</div>
         {results.length === 0 ? <div className="empty">{scanning ? "Taranıyor, lütfen bekleyin…" : "Sonuç yok."}</div> :
@@ -429,12 +460,20 @@ function Scanner({ setPage, apiStatus }: { setPage: (p: PageName) => void; apiSt
                 <div key={(r.symbol ?? "x") + idx} className="list-item" onClick={() => { if (!anyErr) setPage("signals"); }}>
                   <div className="l-main">
                     <div className="l-sym">{r.symbol}</div>
-                    <div className="l-tf">{anyErr ? "hatalı" : `${(r as any).timeframe} · ${(r as any).strategy.join(",")}`}</div>
+                    <div className="l-tf">{anyErr ? "hatalı" : `${(r as any).barSent ?? (r as any).timeframe} · ${(r as any).strategy.join(",")}`}</div>
                   </div>
                   <div className="text-right">
-                    <div className={`l-side ${sideClass(r.side)}`}>{sideLabel(r.side as any)}</div>
-                    <div className="l-score">{anyErr ? (r as any).error : `Puan ${r.score} · RR ${(r as any).rr ?? "—"}`}</div>
+                    <div className={`l-side ${sideClass(r.side)}`}>
+                      {(r as any).strength === "watch" ? "İzleme" : sideLabel(r.side as any)}
+                    </div>
+                    <div className="l-score">{anyErr ? (r as any).error : `Puan ${r.score} · ${sideClass(r.side)}${(r as any).strength === "watch" ? " (izleme)" : ""}`}</div>
                     <div className="small mono">{fmtPrice((r as any).price)}</div>
+                    {!anyErr && (r as any).strength === "watch" && (r as any).watchReasons?.length > 0 && (
+                      <div className="small">{(r as any).watchReasons.slice(0, 2).join(" · ")}</div>
+                    )}
+                    {!anyErr && (r as any).strength !== "strong" && (r as any).rejectReasons?.length > 0 && (
+                      <div className="small">{(r as any).rejectReasons.slice(0, 2).join(" · ")}</div>
+                    )}
                   </div>
                 </div>
               );
