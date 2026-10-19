@@ -47,6 +47,8 @@ export type ScanOutput = {
   barsUsed: Record<string, string>;
   /** Eksik mum için geçmiş candle'ların getirilip geri doldurulduğu coinler */
   backfilled: string[];
+  /** Kullanıcı taramayı durdurdu mu */
+  stopped?: boolean;
 };
 
 /** Eksik mum varsa geçmiş candles endpoint'i ile geri doldurur */
@@ -133,9 +135,11 @@ export async function scanNextBatch(opts: {
   prev?: ScanSnapshot | null;
   onRow?: (row: ScanResultRow, idx: number) => void;
   onProgress?: (p: ScanProgress) => void;
+  /** Durdurma sinyali: true döndüğünde tarama daha fazla coin başlatmaz */
+  shouldStop?: () => boolean;
   signal: (s: any) => Promise<void>;
 }): Promise<ScanOutput> {
-  const { instType, timeframe, strategy, onRow, onProgress } = opts;
+  const { instType, timeframe, strategy, onRow, onProgress, shouldStop } = opts;
 
   // 1) Sabit snapshot
   let snapshot: ScanSnapshot = opts.prev ?? { instIds: [], scanned: [] };
@@ -167,6 +171,12 @@ export async function scanNextBatch(opts: {
   const barSent = toBar(timeframe); // gerçekten OKX'e gönderilen bar
   const NaN_v = (v: any) => typeof v !== "number" || !isFinite(v);
   for (let idx = 0; idx < batch.length; idx++) {
+    if (shouldStop?.()) {
+      // Durduruldu: hiçbir yeni analiz başlatılmaz, tarananlar korumaya alınır
+      const pStopped = makeProgress({ instIds: snapshot.instIds, scanned: snapshot.scanned }, idx, eligible, false);
+      onProgress?.(pStopped);
+      return { rows, failed, progress: pStopped, snapshot, barsUsed, backfilled: backfilledCoins, stopped: true };
+    }
     const instId = batch[idx];
     onProgress?.(makeProgress({ instIds: snapshot.instIds, scanned: [...snapshot.scanned, ...batch.slice(0, idx)] }, idx + 1, eligible, false));
     try {

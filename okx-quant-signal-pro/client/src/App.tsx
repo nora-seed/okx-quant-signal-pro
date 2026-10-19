@@ -36,17 +36,16 @@ class ErrorBoundary extends React.Component<{ children: React.ReactNode }, { has
 }
 
 /* ================= APP ================= */
-type PageName = "dashboard" | "scanner" | "signals" | "charts" | "trades" | "strategies" | "settings";
+type PageName = "dashboard" | "scanner" | "signals" | "trades" | "strategies" | "settings";
 
 function App() {
-  const [page, setPage] = useState<"dashboard"|"scanner"|"signals"|"charts"|"trades"|"strategies"|"settings">("dashboard");
+  const [page, setPage] = useState<"dashboard"|"scanner"|"signals"|"trades"|"strategies"|"settings">("dashboard");
   const [apiStatus, setApiStatus] = useState<"ok"|"fail"|"checking">("checking");
   const [error, setError] = useState<string | null>(null);
   const navRefs = {
     dashboard: "📊",
     scanner: "🔎",
     signals: "📡",
-    charts: "📈",
     trades: "📒",
     strategies: "⚙️",
     settings: "🛡️",
@@ -99,7 +98,6 @@ function App() {
           {page === "dashboard" && <Dashboard setPage={setPageWith} apiStatus={apiStatus} />}
           {page === "scanner" && <Scanner setPage={setPageWith} apiStatus={apiStatus} />}
           {page === "signals" && <SignalsPage setPage={setPageWith} apiStatus={apiStatus} />}
-          {page === "charts" && <ChartsPage setPage={setPageWith} apiStatus={apiStatus} />}
           {page === "trades" && <TradesPage setPage={setPageWith} apiStatus={apiStatus} />}
           {page === "strategies" && <StrategiesPage setPage={setPageWith} apiStatus={apiStatus} />}
           {page === "settings" && <SettingsPage setPage={setPageWith} apiStatus={apiStatus} />}
@@ -111,7 +109,6 @@ function App() {
           { key: "dashboard", label: "Dashboard" },
           { key: "scanner", label: "Piyasa Tarayıcı" },
           { key: "signals", label: "Sinyaller" },
-          { key: "charts", label: "Grafikler" },
           { key: "trades", label: "İşlemler" },
           { key: "strategies", label: "Stratejiler" },
           { key: "settings", label: "Ayarlar" },
@@ -305,6 +302,12 @@ function Scanner({ setPage, apiStatus }: { setPage: (p: PageName) => void; apiSt
   const [snapshot, setSnapshot] = useState<ScanSnapshot | null>(null);
   const [scanError, setScanError] = useState<string | null>(null);
   const [diagnostics, setDiagnostics] = useState<{ analyzed: number; apiErrors: number; strongAL: number; strongSAT: number; watch: number; bekle: number; backfilled: string[] } | null>(null);
+  // Tarama durumu: Hazır / Taranıyor / Tamamlandı / Durduruldu / Hata
+  const [status, setStatus] = useState<"hazir" | "taranıyor" | "tamamlandi" | "durduruldu" | "hata">("hazir");
+  const [lastScanAt, setLastScanAt] = useState<number | null>(null);
+  const stopRef = useRef(false);
+  const genRef = useRef(0); // eski/geç gelen taramaların yeni turu ezmesini önler
+  const hasRunRef = useRef(false); // kullanıcı butonuna basılmadan tarama YOK
   const listDone = progress?.done === true;
 
   // Kayıtlı strateji tercihini açılışta uygula
@@ -316,32 +319,47 @@ function Scanner({ setPage, apiStatus }: { setPage: (p: PageName) => void; apiSt
     return () => { mounted = false; };
   }, []);
 
+  // Snapshot'ı geri yükle (tarama BAŞLATILMAZ — manuel tarama)
   useEffect(() => {
     let mounted = true;
-    api.loadScanState().then((s) => { if (mounted && s && s.instIds?.length) setSnapshot({ instIds: s.instIds, scanned: s.scanned || [] }); }).catch(() => {});
+    api.loadScanState().then((s) => {
+      if (mounted && s && s.instIds?.length) {
+        setSnapshot({ instIds: s.instIds, scanned: s.scanned || [] });
+        if (s.lastScanAt) setLastScanAt(s.lastScanAt);
+      }
+    }).catch(() => {});
     return () => { mounted = false; };
   }, []);
 
   const persistSnapshot = async (s: ScanSnapshot | null) => {
     setSnapshot(s);
-    if (s) await api.saveScanState(s);
+    if (s) await api.saveScanState({ ...s, lastScanAt: lastScanAt ?? undefined });
   };
 
-  const scanRound = async (beginFromScratch: boolean) => {
-    if (scanning) return;
+  const scanRound = async (mode: "start" | "next" | "restart") => {
+    if (scanning) return; // aynı anda iki tarama engellenir
+    const myGen = ++genRef.current;
+    stopRef.current = false;
     setScanning(true);
+    hasRunRef.current = true;
+    setStatus("taranıyor");
     setScanError(null);
+    setResults([]); // yeni tur başlamadan eski sonuç kartları temizlenir
+    setDiagnostics(null);
     try {
-      const prev: ScanSnapshot | null = beginFromScratch ? null : snapshot;
-      if (beginFromScratch) await api.clearScanState();
+      const prev: ScanSnapshot | null = mode === "restart" ? null : snapshot;
+      if (mode === "restart") await api.clearScanState();
       const out = await scanNextBatch({
         instType,
         timeframe,
         strategy: strategy as StrategyId[],
         prev,
-        onProgress: (p) => setProgress({ ...p }),
+        onProgress: (p) => { if (genRef.current === myGen) setProgress({ ...p }); },
+        shouldStop: () => stopRef.current,
         signal: async (s) => { await api.saveSignal(s); },
       });
+      if (genRef.current !== myGen) return; // geç gelen eski tarama sonucu sayılmaz
+      const now = Date.now();
       for (const r of out.rows) {
         if (!("error" in r) && r.side !== "BEKLE") {
           try { await api.saveSignal(r); } catch { /* sessiz */ }
@@ -361,19 +379,23 @@ function Scanner({ setPage, apiStatus }: { setPage: (p: PageName) => void; apiSt
         bekle: okRows.filter((r) => r.strength === "off").length,
         backfilled: out.backfilled,
       });
-      await persistSnapshot(out.snapshot);
+      if (out.stopped) {
+        setStatus("durduruldu");
+      } else {
+        setStatus("tamamlandi");
+        setLastScanAt(now);
+        await persistSnapshot({ ...out.snapshot, });
+        await api.saveScanState({ instIds: out.snapshot.instIds, scanned: out.snapshot.scanned, lastScanAt: now });
+      }
     } catch (e: any) {
-      setScanError(e?.message || "Tarama başarısız");
+      if (genRef.current === myGen) {
+        setScanError(e?.message || "Tarama başarısız");
+        setStatus("hata");
+      }
     } finally {
-      setScanning(false);
+      if (genRef.current === myGen) setScanning(false);
     }
   };
-
-  // İlk açılışta kaldığı yerden (yoksa ilk 20'den) tarar
-  useEffect(() => {
-    scanRound(true);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 
   const sideClass = (s: string) =>
     s.includes("LONG") || s === "SPOT_AL" ? "long" : s.includes("SHORT") || s === "SPOT_SAT" ? "short" : "wait";
@@ -402,17 +424,32 @@ function Scanner({ setPage, apiStatus }: { setPage: (p: PageName) => void; apiSt
           {STRATEGIES.map((s) => <option key={s.id} value={s.id}>{s.label}</option>)}
         </select>
         <div className="btn-row mt-12">
-          <button className="btn" disabled={scanning || listDone} onClick={() => scanRound(false)}>
-            {scanning ? "Taranıyor…" : "Sonraki 20 Coin"}
-          </button>
-          <button className="btn-sm secondary" disabled={scanning} onClick={() => { setResults([]); scanRound(true); }}>
+          {!hasRunRef.current ? (
+            <button className="btn" disabled={scanning} onClick={() => scanRound("start")}>
+              {scanning ? "Taranıyor…" : "Taramayı Başlat"}
+            </button>
+          ) : (
+            <button className="btn" disabled={scanning || listDone} onClick={() => scanRound("next")}>
+              {scanning ? "Taranıyor…" : "Sonraki 20 Coin"}
+            </button>
+          )}
+          <button className="btn-sm secondary" disabled={scanning} onClick={() => { setResults([]); scanRound("restart"); }}>
             Baştan Tara
           </button>
+          {scanning && (
+            <button className="btn-sm" onClick={() => { stopRef.current = true; }}>
+              Taramayı Durdur
+            </button>
+          )}
+        </div>
+        <div className="small mt-8">
+          Durum: <b>{status === "hazir" ? "Hazır" : status === "taranıyor" ? "Taranıyor" : status === "tamamlandi" ? "Tamamlandı" : status === "durduruldu" ? "Durduruldu" : "Hata"}</b>
+          {lastScanAt ? <> · Son tarama: {new Date(lastScanAt).toLocaleString("tr-TR")}</> : ""}
         </div>
         <div className="small mt-8">
           {progress ? (
             <>Tur {progress.round} · Bu turdaki ilerleme {progress.current}/{progress.total} · Uygun coin: {progress.eligibleCount} · Kalan: {progress.remainingCount}{progress.done ? " · Liste Bitti ✅" : ""}</>
-          ) : "Uygun enstrümanlar yükleniyor… (hacim + likidite + spread önceliği)"}
+          ) : "Taramaya başlamak için \"Taramayı Başlat\"a bas. (İlk tarama sırası: hacim + likidite + spread önceliği)"}
         </div>
       </div>
 
@@ -420,14 +457,14 @@ function Scanner({ setPage, apiStatus }: { setPage: (p: PageName) => void; apiSt
         <div className="card">
           <div className="sub">TARAMA İLERLEME</div>
           <div className="rr-meter"><div className="rr-bar" style={{ width: progress.total ? `${Math.min(100, (progress.current / Math.max(1, progress.total)) * 100)}%` : "0%" }}></div></div>
-          <div className="small mt-4">{progress.current}/{progress.total} coin ilerleme{scanning ? "" : " · paused"}{failed.length ? ` · Başarısız: ${failed.length}` : ""}</div>
+          <div className="small mt-4">{progress.current}/{progress.total} coin ilerleme · {status === "taranıyor" ? "Taranıyor" : status === "tamamlandi" ? "Tamamlandı ✅" : status === "durduruldu" ? "Durduruldu ⏸" : "Hazır"}{failed.length ? ` · Başarısız: ${failed.length}` : ""}</div>
         </div>
       )}
 
       {scanError && (
         <div className="card">
           <div className="alert err">{scanError}</div>
-          <button className="btn-sm" onClick={() => scanRound(false)}>Yeniden Dene</button>
+          <button className="btn-sm" onClick={() => scanRound(hasRunRef.current ? "next" : "start")}>Yeniden Dene</button>
         </div>
       )}
 
@@ -709,65 +746,6 @@ function SignalsPage({ setPage, apiStatus }: { setPage: (p: PageName) => void; a
   );
 }
 
-/* ================= CHARTS ================= */
-function ChartsPage({ setPage, apiStatus }: { setPage: (p: PageName) => void; apiStatus: string }) {
-  const [symbol, setSymbol] = useState("BTC-USDT");
-  const [timeframe, setTimeframe] = useState<Timeframe>("15m");
-  const [candles, setCandles] = useState<any[]>([]);
-  const [chartReady, setChartReady] = useState(false);
-  const chartContainer = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    let mounted = true;
-    api.candles(symbol, timeframe, 300).then((r: any) => { if (mounted) setCandles(r.data || []); });
-    return () => { mounted = false; };
-  }, [symbol, timeframe]);
-
-  useEffect(() => {
-    if (!chartReady || !chartContainer.current || candles.length === 0) return;
-    const container = chartContainer.current;
-    import("lightweight-charts").then(({ createChart }) => {
-      const chart = createChart(container, { layout: { background: { type: "solid" as any, color: "#0a0d17" }, textColor: "#e5eaf2" }, grid: { vertLines: { color: "#1f294a" }, horzLines: { color: "#1f294a" } }, width: container.clientWidth, height: 260 });
-      const candleSeries = chart.addCandlestickSeries({ upColor: "#22c55e", downColor: "#ef4444", borderVisible: false, wickUpColor: "#22c55e", wickDownColor: "#ef4444" });
-      candleSeries.setData(candles.map((c: any) => ({ time: String(Math.floor(c.ts / 1000)), open: c.open, high: c.high, low: c.low, close: c.close })));
-      chart.timeScale().fitContent();
-    });
-  }, [chartReady, candles]);
-
-  return (
-    <>
-      <div className="card">
-        <div className="sub">MUM GRAFİĞİ (Lightweight Charts)</div>
-        <div className="flex-gap-8-ai-c-mb-8-wrap">
-          <div className="form-label m-0">Çift</div>
-          <input className="w-130" value={symbol} onChange={(e) => setSymbol(e.target.value.toUpperCase())} placeholder="BTC-USDT" />
-          <div className="form-label m-0">Periyot</div>
-          <select className="w-auto-p-6" value={timeframe} onChange={(e) => setTimeframe(e.target.value as any)}>
-            {Object.entries(TF_LABELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
-          </select>
-          <button className="btn-sm" onClick={() => setChartReady(true)}>Yenile</button>
-        </div>
-        <div className="chart-wrap" ref={chartContainer}>
-          {candles.length === 0 ? <div className="empty pt-90">Veri yükleniyor…</div> : null}
-        </div>
-      </div>
-
-      <div className="card">
-        <div className="sub">GÖSTERGE LEGENDASI</div>
-        <div className="grid-2-gap-8-fs-12-muted">
-          <div>EMA 9 / 20 / 50 / 100 / 200</div>
-          <div>SMA 50 / 200</div>
-          <div>RSI 14 · MACD · Stochastic RSI</div>
-          <div>ATR 14 · Bollinger Bantları · Supertrend</div>
-          <div>OBV · VWAP · Göreli Hacim</div>
-          <div>Destek / Direnç seviyeleri</div>
-        </div>
-        <div className="small mt-8">Gösterge çizgileri sinyal kartında "Gerekçe" ve indikatör değerleriyle gösterilmektedir.</div>
-      </div>
-    </>
-  );
-}
-
 /* ================= TRADES ================= */
 function TradesPage({ setPage, apiStatus }: { setPage: (p: PageName) => void; apiStatus: string }) {
   const [trades, setTrades] = useState<Trade[]>([]);
@@ -929,14 +907,14 @@ function StrategiesPage({ setPage, apiStatus }: { setPage: (p: PageName) => void
     <div className="card">
       <div className="sub">SEÇİLEBİLİR STRATEJİLER</div>
       <div className="small mt-4">Birden fazla strateji seçebilirsiniz; seçim tarama ve sinyal üretiminde birlikte kullanılır (kalıcıdır).</div>
-      <div className="list mt-8">
+      <div className="strategy-list mt-8">
         {STRATEGIES.map((s) => (
-          <div key={s.id} className="list-item">
-            <div className="l-main">
-              <div className="l-sym">{s.label}</div>
-              <div className="l-tf">{s.id}</div>
+          <div key={s.id} className="strategy-card">
+            <div className="strategy-info">
+              <div className="strategy-name">{s.label}</div>
+              <div className="strategy-code">{s.id}</div>
             </div>
-            <button className={`btn-sm ${enabled.includes(s.id) ? "" : "secondary"}`} onClick={() => toggle(s.id)}>
+            <button className={`strategy-toggle btn-sm ${enabled.includes(s.id) ? "" : "secondary"}`} onClick={() => toggle(s.id)}>
               {enabled.includes(s.id) ? "✓ Açık" : "Kapalı"}
             </button>
           </div>
