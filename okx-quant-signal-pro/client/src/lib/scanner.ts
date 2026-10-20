@@ -10,7 +10,8 @@
  * - Kullanıcıya uygun coin sayısı 20'den azsa kalan sayı doğru gösterilir.
  */
 
-import { fetchInstruments, fetchTickers, fetchCandles, fetchHistoryCandles, toBar, apiCache } from "./okxPublic";
+import { fetchInstruments, fetchTickers, fetchCandles, fetchHistoryCandles, toBar } from "./okxPublic";
+import { computeEarlySignal } from "./earlyEngine";
 import { buildSignal, type Timeframe, type StrategyId, type Signal } from "./signalEngine";
 
 /* Stabilcoin tabanlı çiftler hariç (stabilcoin/USDT çiftlerinde fırsat yok) */
@@ -197,6 +198,20 @@ export async function scanNextBatch(opts: {
       const sig = buildSignal({ symbol: instId, instType, candles: clean, timeframe, strategy });
       (sig as any).barSent = barSent;
       sig.strategy = [...strategy]; // kullanıcı seçiminin gerçekten uygulandığını kaydet
+      // Erken fırsat motoru (3 katman): destek TF'ler 1H + 4H (tetik TF ile aynıysa kalibre etme)
+      try {
+        const oh = timeframe === "1h" ? null : await fetchCandles(instId, "1H", 320);
+        const o4 = timeframe === "4h" ? null : await fetchCandles(instId, "4H", 320);
+        const e = computeEarlySignal({
+          symbol: instId,
+          candles15: clean,
+          candlesOneHour: oh,
+          candlesFourHour: o4,
+          timeframe: timeframe === "1h" ? "1h" : timeframe === "4h" ? "4h" : "15m",
+          barSent,
+        });
+        (sig as any).early = e;
+      } catch { /* erken motor hatası kartı engellemesin */ }
       rows.push(sig); onRow?.(sig, idx);
     } catch (e: any) {
       failed.push({ instId, reason: e?.message || "veri hatası" });

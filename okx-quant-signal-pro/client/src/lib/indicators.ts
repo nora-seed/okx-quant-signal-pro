@@ -180,9 +180,19 @@ export function atr(candles: Candle[], period = 14): (number | null)[] {
     } else {
       atrVal = (atrVal * (period - 1) + tr[i - 1]) / period;
     }
-    out[i] = round(atrVal, 8);
+    out[i] = roundSig(atrVal, 8);
   }
   return out;
+}
+
+/* anlamlı basamak yuvarlama (mikro fiyatlı coinlerde 0'a sönmesin) */
+function roundSig(v: number | null, sig = 8): number | null {
+  if (v == null || !isFinite(v)) return null;
+  const a = Math.abs(v);
+  if (a === 0) return 0;
+  const dec = Math.max(0, sig - Math.floor(Math.log10(a)) - 1);
+  const p = Math.pow(10, dec);
+  return Math.round(v * p) / p;
 }
 
 /* ---------- Bollinger Bands ---------- */

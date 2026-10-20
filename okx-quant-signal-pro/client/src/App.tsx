@@ -1,7 +1,7 @@
 "use strict";
 
 import React, { useState, useEffect, useCallback, useRef } from "react";
-import { api } from "./api";
+import { api, apiExtras } from "./api";
 import {
   type Signal, type Trade, type Perf, type Timeframe, TF_LABELS, STRATEGIES,
   DEFAULT_SYMBOLS, fmtPrice, fmtPct, fmtUsd, sideLabel,
@@ -364,6 +364,19 @@ function Scanner({ setPage, apiStatus }: { setPage: (p: PageName) => void; apiSt
         if (!("error" in r) && r.side !== "BEKLE") {
           try { await api.saveSignal(r); } catch { /* sessiz */ }
         }
+        // Erken fırsat takibi: aynı fırsatın ilerlemesini kaydet (yeni ilgisiz sinyal değil)
+        const er = (r as any).early;
+        if (er && er.phase && er.phase !== "VERI_HATASI") {
+          try {
+            await apiExtras.upsertOpportunity(r.symbol, timeframe, now, {
+              score: er.score, phase: er.phase,
+              entryTrigger: er.entryTrigger, stop: er.stop,
+              t1: er.t1, t2: er.t2,
+              rvol: er.rvol, bbwPctile: er.bbwPctile,
+              reasons: er.reasons ?? [],
+            });
+          } catch { /* sessiz */ }
+        }
       }
       // Sadece bu turun 20 sonucu gösterilir; önceki turlar ekrandan kaldırılır
       setResults(out.rows);
@@ -491,30 +504,65 @@ function Scanner({ setPage, apiStatus }: { setPage: (p: PageName) => void; apiSt
         <div className="sub">SONUÇLAR</div>
         {results.length === 0 ? <div className="empty">{scanning ? "Taranıyor, lütfen bekleyin…" : "Sonuç yok."}</div> :
           <div className="list">
-            {results.map((r, idx) => {
-              const anyErr = "error" in r;
-              return (
-                <div key={(r.symbol ?? "x") + idx} className="list-item" onClick={() => { if (!anyErr) setPage("signals"); }}>
-                  <div className="l-main">
-                    <div className="l-sym">{r.symbol}</div>
-                    <div className="l-tf">{anyErr ? "hatalı" : `${(r as any).barSent ?? (r as any).timeframe} · ${(r as any).strategy.join(",")}`}</div>
+            {(() => {
+      {/* Önem sırasına göre sıralama: ONAYLI > AL ADAYI > ERKEN İZLE > HAZIRLIK > GEÇ KALINDI > BEKLE */}
+        const order = (r: any): number => {
+          const es = r.early?.phase ?? "";
+          if (r.side !== "BEKLE" && r.strength === "strong") return 0;
+          if (es === "ONAYLI_AL") return 1;
+          if (r.side === "AL_ADAYI" || es === "AL_ADAYI") return 2;
+          if (es === "ERKEN_IZLE" || r.strength === "watch") return 3;
+          if (es === "HAZIRLIK") return 4;
+          if (es === "GEC_KALINDI") return 5;
+          if (r.error) return 7;
+          return 6;
+        };
+        const sorted = [...results].sort((a: any, b: any) => order(a) - order(b));
+        return sorted.map((r: any, i: number) => {
+
+          const anyErr = "error" in r;
+          const early = r.early as any;
+          const earlyNeed = early?.missing ?? [];
+          return (
+            <div key={(r.symbol ?? "x") + i} className="list-item" onClick={() => { if (!anyErr) setPage("signals"); }}>
+              <div className="l-main">
+                <div className="l-sym">{r.symbol}</div>
+                <div className="l-tf">{anyErr ? "hatalı" : `${r.barSent ?? r.timeframe} · ${r.strategy.join(",")}`}</div>
+                {!anyErr && early && (
+                  <div className="small mt-4">
+                    <b>Erken:</b> {early.phase} ({early.score}/100) · RVOL {early.rvol ?? "—"} · RSI {early.rsi ?? "—"} · BBW %~{early.bbwPctile != null ? Math.round(early.bbwPctile * 100) : "—"}
+                    {early.reserveDistancePct != null && <> · Dirence %{early.reserveDistancePct}</>}
+                    {early.t4h && <> · 4H: {early.tf4hNote || early.tf4h}</>}
+                    {early.entryTrigger != null && <> · Giriş {fmtPrice(early.entryTrigger)}</>}
                   </div>
-                  <div className="text-right">
-                    <div className={`l-side ${sideClass(r.side)}`}>
-                      {(r as any).strength === "watch" ? "İzleme" : sideLabel(r.side as any)}
-                    </div>
-                    <div className="l-score">{anyErr ? (r as any).error : `Puan ${r.score} · ${sideClass(r.side)}${(r as any).strength === "watch" ? " (izleme)" : ""}`}</div>
-                    <div className="small mono">{fmtPrice((r as any).price)}</div>
-                    {!anyErr && (r as any).strength === "watch" && (r as any).watchReasons?.length > 0 && (
-                      <div className="small">{(r as any).watchReasons.slice(0, 2).join(" · ")}</div>
-                    )}
-                    {!anyErr && (r as any).strength !== "strong" && (r as any).rejectReasons?.length > 0 && (
-                      <div className="small">{(r as any).rejectReasons.slice(0, 2).join(" · ")}</div>
-                    )}
-                  </div>
+                )}
+                {!anyErr && early?.phase === "GEC_KALINDI" && (
+                  <div className="small neg">Hareket uzamış: fiyatı kovalamak riskli; yeni fırsat bekle.</div>
+                )}
+              </div>
+              <div className="text-right">
+                <div className={`l-side ${sideClass(r.side)}`}>
+                  {early?.phase === "GEC_KALINDI" ? "GEÇ KALINDI" : early?.phase === "ONAYLI_AL" ? "ONAYLI AL" : early?.phase === "AL_ADAYI" ? "AL ADAYI" : early?.phase === "ERKEN_IZLE" ? "ERKEN İZLE" : early?.phase === "HAZIRLIK" ? "HAZIRLIK" : (r as any).strength === "watch" ? "İzleme" : sideLabel(r.side as any)}
                 </div>
-              );
-            })}
+                <div className="l-score">{anyErr ? (r as any).error : `Puan ${r.score}${early ? " · Erken " + early.score : ""}`}</div>
+                <div className="small mono">{fmtPrice((r as any).price)}</div>
+                {!anyErr && early && earlyNeed.length > 0 && (
+                  <div className="small">{earlyNeed.slice(0, 3).join(" · ")}</div>
+                )}
+                {!anyErr && early && early.tf4h === "negatif" && (
+                  <div className="small neg">4H trend ters yönde</div>
+                )}
+                {!anyErr && (r as any).strength === "watch" && (r as any).watchReasons?.length > 0 && (
+                  <div className="small">{(r as any).watchReasons.slice(0, 2).join(" · ")}</div>
+                )}
+                {!anyErr && (r as any).strength !== "strong" && (r as any).rejectReasons?.length > 0 && (
+                  <div className="small">{(r as any).rejectReasons.slice(0, 2).join(" · ")}</div>
+                )}
+              </div>
+            </div>
+          );
+        });
+      })()}
           </div>
         }
         {progress?.done && (
@@ -752,13 +800,62 @@ function TradesPage({ setPage, apiStatus }: { setPage: (p: PageName) => void; ap
   const [perf, setPerf] = useState<Perf | null>(null);
   const [tradesError, setTradesError] = useState<string | null>(null);
   const [form, setForm] = useState({ symbol: "", instType: "SPOT" as "SPOT"|"SWAP", side: "LONG", status: "girdi" as const, entryPrice: "", exitPrice: "", qty: "", commission: "", leverage: "1", openedAt: "", closedAt: "", rationale: "" });
+  const [paperTrades, setPaperTrades] = useState<any[]>([]);
+  const [paper, setPaper] = useState({ symbol: "", tf: "1h", entry: "", stop: "", t1: "", t2: "", qty: "", feeBps: "10" });
+  const [paperMsg, setPaperMsg] = useState<string | null>(null);
 
   useEffect(() => {
     let mounted = true;
     api.trades().then((r: any) => { if (mounted) { setTrades(r.data || []); setTradesError(null); } }).catch((e: any) => { if (mounted) setTradesError(e.message || "İşlemler yüklenemedi"); });
     api.performance().then((r: any) => { if (mounted) setPerf(r.data || null); }).catch(() => {});
+    apiExtras.listPaperTrades().then((pt) => { if (mounted) setPaperTrades(pt.sort((a, b) => b.openedTs - a.openedTs)); }).catch(() => {});
     return () => { mounted = false; };
   }, []);
+
+  /* Sanal işlem: gerçek emir YOK; yerel kayıt + fiyat geçmişiyle değerlendirme. */
+  const openPaper = async () => {
+    const entry = parseFloat(paper.entry); const stop = parseFloat(paper.stop);
+    const t1v = parseFloat(paper.t1); const t2v = parseFloat(paper.t2);
+    if (!paper.symbol || !entry) { setPaperMsg("Çift ve giriş fiyatı zorunlu."); return; }
+    const qty = parseFloat(paper.qty) || 100 / entry;
+    try {
+      await apiExtras.openPaperTrade({
+        symbol: paper.symbol.toUpperCase(), triggerTf: paper.tf, side: "AL",
+        openedTs: Date.now(), entry, stop: stop || entry * 0.97,
+        t1: t1v || entry * 1.03, t2: t2v || entry * 1.06,
+        quantity: qty, feeBps: parseFloat(paper.feeBps) || 10, slippageBps: 5,
+      });
+      const list = await apiExtras.listPaperTrades();
+      setPaperTrades(list.sort((a, b) => b.openedTs - a.openedTs));
+      setPaperMsg("Sanal işlem kaydedildi (gerçek emir gönderilmedi).");
+      setPaper({ ...paper, symbol: "", entry: "", stop: "", t1: "", t2: "", qty: "" });
+    } catch (e: any) {
+      setPaperMsg(e?.message || "Kaydedilemedi");
+    }
+  };
+
+  const closePaper = async (pt: any) => {
+    let px = pt.entry;
+    try {
+      const r = await api.tickers("SPOT");
+      const t = (r.data as any[]).find((x) => x.instId === pt.symbol);
+      if (t?.last) px = Number(t.last);
+    } catch { /* giriş fiyatı baz alınır */ }
+    await apiExtras.putPaperTrade({ ...pt, status: "kapandi", closeReason: "manuel", closedTs: Date.now(), exitPrice: px, pnlUsdt: (px - pt.entry) * pt.quantity });
+    const list = await apiExtras.listPaperTrades();
+    setPaperTrades(list.sort((a: any, b: any) => b.openedTs - a.openedTs));
+  };
+
+  const evalPapers = async () => {
+    try {
+      const updated = await apiExtras.evaluateOpenPaperTrades();
+      const list = await apiExtras.listPaperTrades();
+      setPaperTrades(list.sort((a: any, b: any) => b.openedTs - a.openedTs));
+      setPaperMsg(updated.length ? `${updated.length} açık sanal işlem görüntülendi Güncellendi (fiyat geçmişiyle).` : "Açık sanal işlem için yeni olay yok.");
+    } catch (e: any) {
+      setPaperMsg(e?.message || "Değerlendirme başarısız");
+    }
+  };
 
   const addTrade = async () => {
     const openedAt = form.openedAt ? new Date(form.openedAt).getTime() : Date.now();
@@ -779,6 +876,60 @@ function TradesPage({ setPage, apiStatus }: { setPage: (p: PageName) => void; ap
 
   return (
     <>
+      <div className="card">
+        <div className="sub">SANAL İŞLEM (PAPER TRADING)</div>
+        <p className="small">Gerçek emir gönderilmez. Kayıt tarayıcınızda tutulur; uygulama kapalıyken fiyat takibi yapılamaz, yeniden açıldığında mum geçmişiyle değerlendirilir.</p>
+        <div className="grid-2-gap-8">
+          <div>
+            <div className="form-label">Çift</div>
+            <input value={paper.symbol} onChange={(e) => setPaper({ ...paper, symbol: e.target.value.toUpperCase() })} placeholder="BTC-USDT" />
+          </div>
+          <div>
+            <div className="form-label">Zaman dilimi</div>
+            <select value={paper.tf} onChange={(e) => setPaper({ ...paper, tf: e.target.value })}>
+              <option value="15m">15m</option>
+              <option value="1h">1H</option>
+              <option value="4h">4H</option>
+            </select>
+          </div>
+        </div>
+        <div className="grid-3-gap-8 mt-8">
+          <div><div className="form-label">Giriş</div><input type="number" value={paper.entry} onChange={(e) => setPaper({ ...paper, entry: e.target.value })} /></div>
+          <div><div className="form-label">Stop</div><input type="number" value={paper.stop} onChange={(e) => setPaper({ ...paper, stop: e.target.value })} /></div>
+          <div><div className="form-label">T1</div><input type="number" value={paper.t1} onChange={(e) => setPaper({ ...paper, t1: e.target.value })} /></div>
+        </div>
+        <div className="grid-3-gap-8 mt-8">
+          <div><div className="form-label">T2</div><input type="number" value={paper.t2} onChange={(e) => setPaper({ ...paper, t2: e.target.value })} /></div>
+          <div><div className="form-label">Sanal miktar</div><input type="number" value={paper.qty} onChange={(e) => setPaper({ ...paper, qty: e.target.value })} placeholder="opsiyonel" /></div>
+          <div><div className="form-label">Komisyon (bps)</div><input type="number" value={paper.feeBps} onChange={(e) => setPaper({ ...paper, feeBps: e.target.value })} /></div>
+        </div>
+        {paperMsg && <div className="alert ok mt-8">{paperMsg}</div>}
+        <div className="grid-2-gap-8 mt-12">
+          <button className="btn" onClick={openPaper}>Sanal AL Kaydet</button>
+          <button className="btn secondary" onClick={evalPapers}>Açık İşlemleri Değerlendir</button>
+        </div>
+        {paperTrades.length > 0 && (
+          <div className="list mt-8">
+            {paperTrades.slice(0, 25).map((pt) => (
+              <div key={pt.id} className="list-item">
+                <div className="l-main">
+                  <div className="l-sym">{pt.symbol}</div>
+                  <div className="l-tf">{pt.triggerTf} · giriş {Number(pt.entry).toPrecision(6)}</div>
+                </div>
+                <div className="text-right">
+                  <div className={pt.status === "kapandi" ? (pt.pnlUsdt >= 0 ? "pos" : "neg") : ""}>
+                    {pt.status === "kapandi" ? `Kapalı (${pt.closeReason}) · ${pt.pnlUsdt != null ? pt.pnlUsdt.toFixed(2) : "—"} USDT` : "Açık"}
+                  </div>
+                  {pt.status !== "kapandi" && (
+                    <button className="btn-sm secondary" onClick={() => closePaper(pt)}>Manuel Kapat</button>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
       <div className="card">
         <div className="sub">MANUEL İŞLEM GÜNÜĞÜ</div>
         {tradesError && (

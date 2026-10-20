@@ -45,7 +45,7 @@ function throttle() {
 }
 const RATE_SPACING_MS = 110;
 
-async function okxFetch(path: string, params: Record<string, string> = {}): Promise<any> {
+export async function okxFetch(path: string, params: Record<string, string> = {}): Promise<any> {
   if (Date.now() < blockedUntil) {
     throw new Error("OKX API geçici olarak engellendi (rate limit). Kısa süre sonra tekrar deneyin.");
   }
@@ -184,6 +184,8 @@ const STORES = {
   signals: "signals",
   settings: "settings",
   scanState: "scanState",
+  opportunities: "opportunities",
+  paperTrades: "paperTrades",
 };
 
 function openDb(): Promise<IDBDatabase> {

@@ -225,3 +225,166 @@ export type Perf = {
   profitFactor: number; grossProfit: number; grossLoss: number; net: number;
   maxDrawdown: number; totalCommission: number;
 };
+
+/* ---------- Fırsat takibi + Sanal işlem (IndexedDB) ---------- */
+
+export type Opportunity = {
+  id: string; // symbol|triggerTf
+  symbol: string;
+  triggerTf: string;
+  firstSeenTs: number;
+  lastSeenTs: number;
+  firstScore: number;
+  maxScore: number;
+  firstPhase: string;
+  curPhase: string;
+  maxPhase: string;
+  phaseHistory: string[];
+  breakoutTs?: number;
+  invalidTs?: number;
+  lastEntry?: number | null;
+  lastStop?: number | null;
+  lastT1?: number | null;
+  lastT2?: number | null;
+  lastRvol?: number | null;
+  lastBbwPct?: number | null;
+  lastReasons?: string[];
+};
+
+const OPS = "opportunities", PAPERS = "paperTrades";
+
+export type PaperTrade = {
+  id: string;
+  symbol: string;
+  triggerTf: string;
+  side: "AL";
+  openedTs: number;
+  entry: number;
+  stop: number;
+  t1: number;
+  t2: number;
+  quantity: number; // sanal adet
+  feeBps: number;
+  slippageBps: number;
+  status: "open" | "kapandi";
+  closeReason?: "t1" | "t2" | "stop" | "manuel" | "sure";
+  closedTs?: number;
+  exitPrice?: number;
+  pnlUsdt?: number;
+  barsEvaluated?: number;
+};
+
+export const apiExtras = {
+  /** Fırsatı güncelleme: aynı fırsatın ilerlemesini kaydet (yeni ilgisiz sinyal yerine). */
+  async upsertOpportunity(sym: string, tf: string, nowTs: number, row: {
+    score: number; phase: string; entryTrigger: number | null; stop: number | null;
+    t1: number | null; t2: number | null; rvol: number | null; bbwPctile: number | null;
+    reasons: string[];
+  }): Promise<Opportunity> {
+    const id = sym + "|" + tf;
+    let cur: Opportunity | undefined;
+    try {
+      const all = typeof indexedDB !== "undefined" ? await idbAll<Opportunity>(OPS) : [];
+      cur = all.find((o) => o.id === id);
+    } catch { /* yok say */ }
+    const phases = ["VERI_HATASI", "BEKLE", "GEC_KALINDI", "HAZIRLIK", "ERKEN_IZLE", "AL_ADAYI", "ONAYLI_AL"];
+    const maxPh = (a: string, b: string) => (phases.indexOf(a) >= phases.indexOf(b) ? a : b);
+    if (!cur) {
+      cur = {
+        id, symbol: sym, triggerTf: tf,
+        firstSeenTs: nowTs, lastSeenTs: nowTs,
+        firstScore: row.score, maxScore: row.score,
+        firstPhase: row.phase, curPhase: row.phase, maxPhase: row.phase,
+        phaseHistory: [row.phase],
+      };
+    } else {
+      if (row.score > cur.maxScore) cur.maxScore = row.score;
+      const prevPh = cur.curPhase;
+      cur.curPhase = row.phase;
+      if (row.phase !== prevPh && !cur.phaseHistory.includes(row.phase)) cur.phaseHistory.push(row.phase);
+      // yeni aşama yükseldiğinde kırılım anını kaydet
+      if (prevPh !== "ONAYLI_AL" && row.phase === "ONAYLI_AL" && !cur.breakoutTs) cur.breakoutTs = nowTs;
+      if (prevPh !== "GEC_KALINDI" && row.phase === "GEC_KALINDI" && !cur.invalidTs) cur.invalidTs = nowTs;
+    }
+    cur.lastSeenTs = nowTs;
+    cur.maxPhase = maxPh(cur.maxPhase, row.phase);
+    cur.lastEntry = row.entryTrigger; cur.lastStop = row.stop;
+    cur.lastT1 = row.t1; cur.lastT2 = row.t2;
+    cur.lastRvol = row.rvol; cur.lastBbwPct = row.bbwPctile;
+    cur.lastReasons = row.reasons.slice(0, 6);
+    if (typeof indexedDB !== "undefined") {
+      try { await idbPut(OPS, cur); } catch { /* yok say */ }
+    }
+    return cur;
+  },
+
+  async listOpportunities(): Promise<Opportunity[]> {
+    if (typeof indexedDB === "undefined") return [];
+    try { return await idbAll<Opportunity>(OPS); } catch { return []; }
+  },
+
+  async clearOpportunities() {
+    if (typeof indexedDB === "undefined") return;
+    try { await idbClear(OPS); } catch { /* yok say */ }
+  },
+
+  /** Sanal işlem başlat — gerçek emir GÖNDERİLMEZ. */
+  async openPaperTrade(t: Omit<PaperTrade, "id" | "status">): Promise<PaperTrade> {
+    const rec: PaperTrade = { ...t, id: "pt_" + t.openedTs + "_" + Math.floor(Math.random() * 9999), status: "open" };
+    if (typeof indexedDB !== "undefined") {
+      try { await idbPut(PAPERS, rec); } catch { /* yok say */ }
+    }
+    return rec;
+  },
+
+  async listPaperTrades(): Promise<PaperTrade[]> {
+    if (typeof indexedDB === "undefined") return [];
+    try { return await idbAll<PaperTrade>(PAPERS); } catch { return []; }
+  },
+
+  async putPaperTrade(t: PaperTrade) {
+    if (typeof indexedDB === "undefined" || !t.id) return;
+    try { await idbPut(PAPERS, t); } catch { /* yok say */ }
+  },
+
+  /** Açık sanal işlemler: App açıldığında geçmiş veriyle değerlendir.
+   *  Not: PWA kapalıyken fiyat takibi yapılamaz; yeniden açıldığında gözden geçirilir.
+   */
+  async evaluateOpenPaperTrades(applyFeeBps = 10) {
+    const trades = await this.listPaperTrades();
+    const updates: PaperTrade[] = [];
+    for (const t of trades.filter((x) => x.status === "open")) {
+      try {
+        const tfBar = t.triggerTf;
+        const oPublic = (await import("./lib/okxPublic"));
+        const list = (await oPublic.fetchCandles(t.symbol, tfBar, 100)) as any[];
+        const listOk = list.filter((c: any) => c.close != null && c.ts != null).sort((a: any, b: any) => a.ts - b.ts);
+        const seq = listOk.filter((c: any) => {
+          const endTs = t.triggerTf === "4H" ? c.ts + 4 * 3600_000 : t.triggerTf === "1H" ? c.ts + 3600_000 : c.ts + 900_000;
+          return endTs >= t.openedTs && (c.confirm !== 0);
+        });
+        let exit: number | undefined, why: PaperTrade["closeReason"], closedTs: number | undefined;
+        for (const c of seq) {
+          if (c.low <= t.stop) { exit = t.stop; why = "stop"; closedTs = c.ts; break; }
+          if (c.high >= t.t2) { exit = t.t2; why = "t2"; closedTs = c.ts; break; }
+          if (c.high >= t.t1) { exit = t.t1; why = "t1"; closedTs = c.ts; break; }
+        }
+        if (exit != null && why != null) {
+          const slip = t.slippageBps / 10000;
+          const entryP = t.entry * (1 + slip);
+          const exitP = why === "stop" ? exit * (1 - slip) : exit;
+          const gross = (exitP - entryP) * t.quantity;
+          const fees = (entryP + exitP) * t.quantity * (t.feeBps / 10000);
+          t.status = "kapandi";
+          t.closeReason = why;
+          t.closedTs = closedTs ?? Date.now();
+          t.exitPrice = exit;
+          t.pnlUsdt = gross - fees;
+          updates.push(t);
+        }
+      } catch { /* veri yoksa işlemden vazgeç; bir sonraki sefere tekrar dener */ }
+    }
+    for (const u of updates) await this.putPaperTrade(u);
+    return updates;
+  },
+};
